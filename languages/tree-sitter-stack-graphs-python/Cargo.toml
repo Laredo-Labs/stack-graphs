@@ -25,13 +25,18 @@ path = "rust/test.rs"
 harness = false
 
 [features]
-cli = ["anyhow", "clap", "tree-sitter-stack-graphs/cli"]
+cli = ["anyhow", "clap", "tree-sitter-stack-graphs/cli", "serde", "serde_json"]
+serde = ["dep:serde", "serde_with", "serde_json"]
+
 
 [dependencies]
 anyhow = { version = "1.0", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
 tree-sitter-stack-graphs = { version = "0.9", path = "../../tree-sitter-stack-graphs" } # explicit version is required to be able to publish crate
 tree-sitter-python = "=0.20.4"
+serde = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
+serde_with = { version = "3.1", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0"

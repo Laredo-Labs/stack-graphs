@@ -4,6 +4,7 @@
 // Licensed under either of Apache License, Version 2.0, or MIT license, at your option.
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
+//use std::any::type_name;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -32,6 +33,9 @@ use crate::loader::FileReader;
 use crate::CancellationFlag;
 use crate::NoCancellation;
 
+use serde_json::json;
+use serde_json::Value;
+
 #[derive(Args)]
 pub struct QueryArgs {
     /// Wait for user input before starting analysis. Useful for profiling.
@@ -52,6 +56,7 @@ impl QueryArgs {
         }
         let mut db = SQLiteReader::open(&db_path)?;
         let stitching_stats = self.target.run(&mut db, self.stats)?;
+
         if self.stats {
             println!();
             print_stitching_stats(stitching_stats);
@@ -65,6 +70,7 @@ impl QueryArgs {
 #[derive(Subcommand)]
 pub enum Target {
     Definition(Definition),
+    DefinitionJson(DefinitionJson)
 }
 
 impl Target {
@@ -72,9 +78,12 @@ impl Target {
         let reporter = ConsoleReporter::details();
         let mut querier = Querier::new(db, &reporter);
         querier.set_collect_stats(collect_stats);
+
         match self {
             Self::Definition(cmd) => cmd.run(&mut querier)?,
+            Self::DefinitionJson(cmd) => cmd.run(&mut querier)?,
         }
+
         Ok(querier.into_stats())
     }
 }
@@ -91,13 +100,60 @@ pub struct Definition {
     pub references: Vec<SourcePosition>,
 }
 
+#[derive(Parser)]
+pub struct DefinitionJson {
+    /// Reference source positions, formatted as PATH:LINE:COLUMN.
+    #[clap(
+        value_name = "SOURCE_POSITION",
+        required = true,
+        value_hint = ValueHint::AnyPath,
+        value_parser,
+    )]
+    pub references: Vec<SourcePosition>,
+}
+
+struct ExcerptParams {
+    path: String,
+    content: Value,  // Use Value instead of String for JSON content
+    first_line: String,
+    first_line_column_range: String,
+    indent: String,
+    definitions: Vec<ExcerptParams>,
+}
+
+impl ExcerptParams {
+    fn to_json_string(&self) -> String {
+        let definitions_json: Vec<String> = self
+            .definitions
+            .iter()
+            .map(|def| def.to_json_string())
+            .collect();
+
+        format!(
+            r#"{{
+    "path": "{}",
+    "content": {},
+    "first_line": "{}",
+    "first_line_column_range": "{}",
+    "indent": "{}",
+    "definitions": [{}]
+}}"#,
+            self.path,
+            self.content,  // Insert the Value directly
+            self.first_line,
+            self.first_line_column_range,
+            self.indent,
+            definitions_json.join(", ")
+        )
+    }
+}
+
 impl Definition {
     pub fn run(self, querier: &mut Querier) -> anyhow::Result<()> {
         let cancellation_flag = NoCancellation;
         let mut file_reader = FileReader::new();
         for mut reference in self.references {
             reference.canonicalize()?;
-
             let results = querier.definitions(reference.clone(), &cancellation_flag)?;
             let numbered = results.len() > 1;
             let indent = if numbered { 6 } else { 0 };
@@ -127,11 +183,13 @@ impl Definition {
                         indent
                     )
                 );
+
                 match definitions.len() {
                     0 => println!("{}has no definitions", " ".repeat(indent)),
                     1 => println!("{}has definition", " ".repeat(indent)),
                     n => println!("{}has {} definitions", " ".repeat(indent), n),
                 }
+
                 for definition in definitions.into_iter() {
                     print!(
                         "{}",
@@ -144,7 +202,54 @@ impl Definition {
                         )
                     );
                 }
-            }
+           }
+        }
+        Ok(())
+    }
+}
+
+impl DefinitionJson {
+    pub fn run(self, querier: &mut Querier) -> anyhow::Result<()> {
+        let cancellation_flag = NoCancellation;
+        let mut file_reader = FileReader::new();
+        let mut reference_vec = vec![];
+        for mut reference in self.references {
+            reference.canonicalize()?;
+            let results = querier.definitions_json(reference.clone(), &cancellation_flag)?;
+            let numbered = results.len() > 1;
+            let indent = if numbered { 6 } else { 0 };
+            for (
+                _idx,
+                QueryResult {
+                    source: reference,
+                    targets: definitions,
+                },
+            ) in results.into_iter().enumerate()
+            {
+                let mut excerpt = ExcerptParams {
+                    path: reference.path.to_string_lossy().into_owned().to_string(),
+                    content: json!(file_reader.get(&reference.path).unwrap_or_default()),
+                    first_line: reference.first_line().to_string(),
+                    first_line_column_range: format!("{:?}", reference.first_line_column_range()),
+                    indent: indent.to_string(),
+                    definitions: vec![],
+                };
+
+                for definition in definitions.into_iter() {
+                    excerpt.definitions.push(ExcerptParams {
+                        path: definition.path.to_string_lossy().into_owned().to_string(),
+                        content: json!(file_reader.get(&definition.path).unwrap_or_default()),
+                        first_line: definition.first_line().to_string(),
+                        first_line_column_range: format!("{:?}", definition.first_line_column_range()),
+                        indent: indent.to_string(),
+                        definitions: vec![]
+                    });
+                }
+                reference_vec.push(excerpt)
+           }
+            let json_excerpts: Vec<String> = reference_vec.iter().map(|e| e.to_json_string()).collect();
+            let json_array = format!("[{}]", json_excerpts.join(", "));
+            println!("{}", json_array);
         }
         Ok(())
     }
@@ -286,6 +391,105 @@ impl<'a> Querier<'a> {
             ),
             None,
         );
+        Ok(result)
+    }
+
+    pub fn definitions_json(
+        &mut self,
+        reference: SourcePosition,
+        cancellation_flag: &dyn CancellationFlag,
+    ) -> Result<Vec<QueryResult>> {
+        let log_path = PathBuf::from(reference.to_string());
+
+        let mut file_reader = FileReader::new();
+        let tag = file_reader.get(&reference.path).ok().map(sha1);
+        match self
+            .db
+            .status_for_file(&reference.path.to_string_lossy(), tag.as_ref())?
+        {
+            FileStatus::Indexed => {}
+            _ => {
+                return Ok(Default::default());
+            }
+        }
+
+        self.db
+            .load_graph_for_file(&reference.path.to_string_lossy())?;
+        let (graph, _, _) = self.db.get();
+
+        let starting_nodes = reference.iter_references(graph).collect::<Vec<_>>();
+        if starting_nodes.is_empty() {
+            return Ok(Default::default());
+        }
+
+        let mut result = Vec::new();
+        for (node, span) in starting_nodes {
+            let reference_span = SourceSpan {
+                path: reference.path.clone(),
+                span,
+            };
+
+            let mut reference_paths = Vec::new();
+            let stitcher_config = StitcherConfig::default()
+                // always detect similar paths, we don't know the language configurations for the data in the database
+                .with_detect_similar_paths(true)
+                .with_collect_stats(self.stats.is_some());
+            let ref_result = ForwardPartialPathStitcher::find_all_complete_partial_paths(
+                self.db,
+                std::iter::once(node),
+                stitcher_config,
+                &cancellation_flag,
+                |_g, _ps, p| {
+                    reference_paths.push(p.clone());
+                },
+            );
+            match ref_result {
+                Ok(ref_stats) => {
+                    if let Some(stats) = &mut self.stats {
+                        *stats += ref_stats
+                    }
+                }
+                Err(err) => {
+                    self.reporter.failed(&log_path, "query timed out", None);
+                    return Err(err.into());
+                }
+            }
+
+            let (graph, partials, _) = self.db.get();
+            let mut actual_paths = Vec::new();
+            for reference_path in &reference_paths {
+                if let Err(err) = cancellation_flag.check("shadowing") {
+                    self.reporter.failed(&log_path, "query timed out", None);
+                    return Err(err.into());
+                }
+                if reference_paths
+                    .iter()
+                    .all(|other| !other.shadows(partials, reference_path))
+                {
+                    actual_paths.push(reference_path.clone());
+                }
+            }
+
+            let definitions = actual_paths
+                .into_iter()
+                .filter_map(|path| {
+                    let span = match graph.source_info(path.end_node) {
+                        Some(p) => p.span.clone(),
+                        None => return None,
+                    };
+                    let path = match graph[path.end_node].id().file() {
+                        Some(f) => PathBuf::from(graph[f].name()),
+                        None => return None,
+                    };
+                    Some(SourceSpan { path, span })
+                })
+                .collect::<Vec<_>>();
+
+            result.push(QueryResult {
+                source: reference_span,
+                targets: definitions,
+            });
+        }
 
         Ok(result)
     }
